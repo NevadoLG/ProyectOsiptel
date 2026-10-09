@@ -1,0 +1,27 @@
+# Datos originales y generados
+data/
+
+# Registros de ejecución
+logs/
+
+# Evidencias locales
+evidencias/
+
+# Entornos virtuales
+bigdata_env/
+venv/
+.venv/
+
+# Archivos temporales de Python
+__pycache__/
+*.pyc
+
+# Archivos temporales de Jupyter
+.ipynb_checkpoints/
+
+# Configuraciones privadas
+.env
+.env.*
+
+# Archivos temporales del sistema
+.DS_Store
