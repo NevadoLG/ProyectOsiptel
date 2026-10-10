@@ -1,45 +1,88 @@
-
 from pathlib import Path
 import subprocess
+import tempfile
 import csv
+from collections import Counter
 BASE = Path(__file__).resolve().parent.parent
-ORIGEN = BASE / "data/raw/pdf"
-DESTINO = BASE / "data/extracted/txt"
-LOG = BASE / "logs/extraccion_pdfs.csv"
-DESTINO.mkdir(parents=True, exist_ok=True)
-# 1 Primero identifico los pdfs originales
+PDF_ROOT = BASE / "data/raw/pdf"
+TXT_ROOT = BASE / "data/extracted/txt"
+EXCEL_ROOT = BASE / "data/raw/excel"
+LOG = BASE / "logs/inventario_fuentes.csv"
+registros = []
 pdfs = sorted(
-    p for p in ORIGEN.iterdir()
+    p for p in PDF_ROOT.rglob("*")
     if p.is_file() and p.suffix.lower() == ".pdf"
 )
 print(f"PDF encontrados: {len(pdfs)}")
-# 2 Extraemos el texto y registramos los resultados
-resultados = {"OK": 0, "VACIO": 0, "ERROR": 0}
-with LOG.open("w", newline="", encoding="utf-8") as archivo:
-    writer = csv.writer(archivo)
-    writer.writerow(["pdf", "txt", "palabras", "estado", "detalle"])
-    for pdf in pdfs:
-        txt = DESTINO / f"{pdf.stem}.txt"
+for pdf in pdfs:
+    relativa = pdf.relative_to(PDF_ROOT)
+    txt = TXT_ROOT / relativa.with_suffix(".txt")
+    txt.parent.mkdir(parents=True, exist_ok=True)
+    fuente = (
+        relativa.parts[0]
+        if len(relativa.parts) > 1
+        else "osiptel_regulatorio"
+    )
+    if txt.exists() and txt.read_text(
+        encoding="utf-8", errors="replace"
+    ).strip():
+        estado = "CONSERVADO"
+    else:
         try:
-            subprocess.run(
-                ["pdftotext", "-layout", str(pdf), str(txt)],
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            palabras = len(txt.read_text(
-                encoding="utf-8", errors="replace"
-            ).split())
-            estado = "OK" if palabras > 0 else "VACIO"
-            detalle = ""
+            with tempfile.TemporaryDirectory(
+                dir=txt.parent
+            ) as temporal:
+                salida = Path(temporal) / "extraido.txt"
+                subprocess.run(
+                    ["pdftotext", "-layout", str(pdf), str(salida)],
+                    check=True,
+                    capture_output=True
+                )
+                if salida.exists() and salida.read_text(
+                    encoding="utf-8", errors="replace"
+                ).strip():
+                    salida.replace(txt)
+                    estado = "EXTRAIDO"
+                else:
+                    estado = "PENDIENTE_OCR"
         except Exception as error:
-            palabras = 0
             estado = "ERROR"
-            detalle = str(error)
-        resultados[estado] += 1
-        writer.writerow([pdf.name, txt.name, palabras, estado, detalle])
-# 3 Luego generamos el resumen
-print("\nRESULTADO DE EXTRACCION")
-for estado, cantidad in resultados.items():
+            print(f"Error en {pdf.name}: {error}")
+    registros.append({
+        "fuente": fuente,
+        "tipo": "PDF",
+        "archivo": pdf.name,
+        "ruta_original": str(pdf.relative_to(BASE)),
+        "ruta_extraida": str(txt.relative_to(BASE)),
+        "estado": estado
+    })
+for excel in sorted(EXCEL_ROOT.rglob("*")):
+    if not excel.is_file():
+        continue
+    if excel.suffix.lower() not in (".xlsx", ".xls", ".csv"):
+        continue
+    registros.append({
+        "fuente": "osiptel_conexiones",
+        "tipo": "ESTRUCTURADO",
+        "archivo": excel.name,
+        "ruta_original": str(excel.relative_to(BASE)),
+        "ruta_extraida": "",
+        "estado": "PENDIENTE_ETL"
+    })
+LOG.parent.mkdir(parents=True, exist_ok=True)
+with LOG.open("w", newline="", encoding="utf-8") as f:
+    writer = csv.DictWriter(
+        f,
+        fieldnames=[
+            "fuente", "tipo", "archivo",
+            "ruta_original", "ruta_extraida", "estado"
+        ]
+    )
+    writer.writeheader()
+    writer.writerows(registros)
+print("\nRESUMEN DE FUENTES")
+for estado, cantidad in Counter(
+    r["estado"] for r in registros
+).items():
     print(f"{estado}: {cantidad}")
-print(f"\nRegistro guardado en: {LOG}")
+print(f"\nInventario: {LOG}")

@@ -4,38 +4,27 @@ import tempfile
 import csv
 import time
 BASE = Path(__file__).resolve().parent.parent
-ORIGEN = BASE / "data/raw/pdf"
-DESTINO = BASE / "data/extracted/txt"
-REGISTRO = BASE / "logs/extraccion_pdfs.csv"
+INVENTARIO = BASE / "logs/inventario_fuentes.csv"
 LOG = BASE / "logs/ocr_pdfs.csv"
-# Lo priomero es identificar automaticamente los pdfs que nos salieron vacios
-with REGISTRO.open(encoding="utf-8", newline="") as f:
+with INVENTARIO.open(encoding="utf-8", newline="") as f:
     pendientes = [
-        fila["pdf"]
-        for fila in csv.DictReader(f)
-        if fila["estado"] == "VACIO"
+        fila for fila in csv.DictReader(f)
+        if fila["estado"] == "PENDIENTE_OCR"
     ]
-print(f"PDF identificados para OCR: {len(pendientes)}")
-procesados = 0
-omitidos = 0
-errores = 0
-for indice, nombre in enumerate(pendientes, 1):
-    pdf = ORIGEN / nombre
-    txt = DESTINO / f"{pdf.stem}.txt"
-    # Evitamos repetir los documentos que ya procesados
+print(f"Documentos pendientes de OCR: {len(pendientes)}")
+for fila in pendientes:
+    pdf = BASE / fila["ruta_original"]
+    txt = BASE / fila["ruta_extraida"]
     if txt.exists() and txt.read_text(
         encoding="utf-8", errors="replace"
     ).strip():
-        print(f"[{indice}/{len(pendientes)}] OMITIDO: {nombre}")
-        omitidos += 1
+        print(f"CONSERVADO: {pdf.name}")
         continue
-    print(f"[{indice}/{len(pendientes)}] OCR: {nombre}", flush=True)
     inicio = time.perf_counter()
     estado = "OK"
     detalle = ""
-    palabras = 0
-    procesadas = 0
     paginas = 0
+    palabras = 0
     try:
         info = subprocess.run(
             ["pdfinfo", str(pdf)],
@@ -47,66 +36,51 @@ for indice, nombre in enumerate(pendientes, 1):
             if linea.startswith("Pages:")
         ))
         textos = []
-        with tempfile.TemporaryDirectory() as temporal:
-            imagen = Path(temporal) / "pagina"
+        with tempfile.TemporaryDirectory() as carpeta:
+            imagen = Path(carpeta) / "pagina"
+            imagen_png = Path(str(imagen) + ".png")
             for numero in range(1, paginas + 1):
-                archivo_imagen = Path(str(imagen) + ".png")
                 subprocess.run([
                     "pdftoppm",
                     "-f", str(numero),
                     "-l", str(numero),
                     "-r", "180",
-                    "-gray",
-                    "-singlefile",
-                    "-png",
-                    str(pdf),
-                    str(imagen)
+                    "-gray", "-singlefile", "-png",
+                    str(pdf), str(imagen)
                 ], check=True, capture_output=True)
                 resultado = subprocess.run([
-                    "tesseract",
-                    str(archivo_imagen),
+                    "tesseract", str(imagen_png),
                     "stdout", "-l", "spa"
-                ], capture_output=True, text=True, check=True)
+                ], check=True, capture_output=True, text=True)
                 textos.append(
-                    f"\n--- PAGINA {numero} ---\n"
+                    f"--- PAGINA {numero} ---\n"
                     + resultado.stdout
                 )
-                archivo_imagen.unlink()
-                procesadas += 1
+                imagen_png.unlink()
         contenido = "\n".join(textos)
         palabras = len(contenido.split())
-        if palabras > 0:
-            temporal_txt = txt.with_suffix(".ocr.tmp")
-            temporal_txt.write_text(contenido, encoding="utf-8")
-            temporal_txt.replace(txt)
-            procesados += 1
+        if palabras:
+            txt.parent.mkdir(parents=True, exist_ok=True)
+            temporal = txt.with_suffix(".ocr.tmp")
+            temporal.write_text(contenido, encoding="utf-8")
+            temporal.replace(txt)
         else:
             estado = "VACIO"
     except Exception as error:
         estado = "ERROR"
         detalle = str(error)
-        errores += 1
     duracion = round(time.perf_counter() - inicio, 2)
     nuevo = not LOG.exists() or LOG.stat().st_size == 0
     with LOG.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if nuevo:
             writer.writerow([
-                "pdf", "paginas", "paginas_procesadas",
-                "palabras", "estado", "duracion_seg",
-                "detalle"
+                "pdf", "paginas", "palabras",
+                "estado", "duracion_seg", "detalle"
             ])
         writer.writerow([
-            nombre, paginas, procesadas,
-            palabras, estado, duracion, detalle
+            str(pdf.relative_to(BASE)), paginas, palabras,
+            estado, duracion, detalle
         ])
-    print(
-        f"  Estado: {estado} | "
-        f"Palabras: {palabras} | Tiempo: {duracion}s",
-        flush=True
-    )
-print("\nRESUMEN FINAL")
-print(f"Procesados: {procesados}")
-print(f"Omitidos: {omitidos}")
-print(f"Errores: {errores}")
-print(f"Registro: {LOG}")
+    print(f"{pdf.name}: {estado} ({palabras} palabras)")
+print("Proceso OCR finalizado.")
