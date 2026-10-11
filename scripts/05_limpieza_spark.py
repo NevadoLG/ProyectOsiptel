@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,11 @@ INDICADORES = [
     "computadora_pct", "internet_pct",
 ]
 COLUMNAS_INEI = ["fuente_pdf", "pagina", "tipo_periodo", "anio", "trimestre", *INDICADORES]
+MANIFIESTO_REPORTES = BASE / "logs/osiptel_reportes_actual.json"
+COLUMNAS_REPORTE = [
+    "anio", "trimestre", "indicador", "valor", "unidad", "fuente_pdf",
+    "fuente_txt", "fragmento_fuente", "metodo_extraccion",
+]
 def hdfs_uri(ruta):
     return "hdfs://" + ruta
 def hdfs(*args, verificar=True):
@@ -45,6 +51,7 @@ def preparar_excel():
         print(f"Excel convertido a CSV ({len(datos)} filas): {csv_local.name}")
     else:
         print(f"CSV intermedio conservado: {csv_local.name}")
+
     destino = HDFS_BASE + "/staging/tablas/" + csv_local.name
     if existe_hdfs(destino):
         tam = int(hdfs("-stat", "%b", destino).stdout.strip())
@@ -59,8 +66,6 @@ def preparar_excel():
 def texto_limpio(nombre):
     texto = F.trim(F.col(nombre))
     return F.when(F.length(texto) == 0, F.lit(None)).otherwise(texto)
-
-
 def completitud(df, columnas, total):
     """Conteo de nulos y % no nulos para columnas criticas y descriptivas."""
     cantidades = df.agg(*[
@@ -79,7 +84,24 @@ def main():
     ruta_csv, version = preparar_excel()
     if not existe_hdfs(INEI_HDFS):
         raise FileNotFoundError(f"INEI no encontrado en HDFS: {INEI_HDFS}")
-
+    if not MANIFIESTO_REPORTES.is_file():
+        raise FileNotFoundError(f"Falta el manifiesto documental generado por el script 03: {MANIFIESTO_REPORTES}")
+    meta_reportes = json.loads(MANIFIESTO_REPORTES.read_text(encoding="utf-8"))
+    nombre_reporte = meta_reportes.get("archivo_csv", "")
+    if not re.fullmatch(r"osiptel_reportes_indicadores_[0-9a-f]{12}\.csv", nombre_reporte):
+        raise ValueError("Nombre de archivo de reportes no valido en el manifiesto")
+    archivo_reporte = BASE / "data/extracted/tablas" / nombre_reporte
+    ruta_reporte = HDFS_BASE + "/staging/tablas/" + nombre_reporte
+    if not archivo_reporte.is_file() or not existe_hdfs(ruta_reporte):
+        raise FileNotFoundError(f"El CSV documental no esta en local y HDFS: {ruta_reporte}")
+    contenido_local = archivo_reporte.read_bytes()
+    digest_local = hashlib.sha256(contenido_local).hexdigest()
+    contenido_remoto = subprocess.run(
+        ["hdfs", "dfs", "-cat", ruta_reporte], capture_output=True, check=True
+    ).stdout
+    digest_remoto = hashlib.sha256(contenido_remoto).hexdigest()
+    if digest_local != meta_reportes.get("sha256") or digest_remoto != digest_local:
+        raise RuntimeError("Fallo de integridad SHA-256: reportes local / HDFS / manifiesto")
     spark = (
         SparkSession.builder.appName("OSIPTEL-Silver-Limpieza-Calidad")
         .config("spark.sql.shuffle.partitions", "8").getOrCreate()
@@ -178,6 +200,40 @@ def main():
         inei_invalidos = inei.filter(condicion_error).count()
         if inei_invalidos:
             raise ValueError(f"INEI contiene {inei_invalidos} filas invalidas: revisar antes de escribir Silver")
+        bruto_reportes = (
+            spark.read.option("header", True).option("multiLine", True)
+            .option("escape", '"').csv(hdfs_uri(ruta_reporte))
+        )
+        if bruto_reportes.columns != COLUMNAS_REPORTE:
+            raise ValueError(f"Cabecera de reportes inesperada: {bruto_reportes.columns}")
+        reportes = bruto_reportes.select(
+            F.col("anio").cast("integer").alias("anio"),
+            F.col("trimestre").cast("integer").alias("trimestre"),
+            F.col("indicador"), F.col("valor").cast("double").alias("valor"),
+            F.col("unidad"), F.col("fuente_pdf"), F.col("fuente_txt"),
+            F.col("fragmento_fuente"), F.col("metodo_extraccion"),
+        ).withColumn("version_csv", F.lit(digest_local[:12]))
+        invalido_reporte = (
+            F.col("anio").isNull() | F.col("trimestre").isNull()
+            | ~F.col("trimestre").between(1, 4) | F.col("valor").isNull()
+            | (F.col("valor") < 0)
+            | ~F.col("indicador").isin("conexiones_fijas", "conexiones_residenciales",
+                                          "conexiones_comerciales", "participacion_fibra")
+            | ~F.col("unidad").isin("conexiones", "porcentaje")
+            | F.col("fuente_pdf").isNull() | F.col("fragmento_fuente").isNull()
+            | F.when(F.col("indicador") == "participacion_fibra",
+                     F.col("unidad") != "porcentaje").otherwise(F.col("unidad") != "conexiones")
+            | (F.col("valor") > F.when(F.col("unidad") == "porcentaje", F.lit(100.0))
+               .otherwise(F.lit(1.0e15)))
+        )
+        if reportes.filter(invalido_reporte).limit(1).count():
+            raise ValueError("Indicadores de reportes OSIPTEL invalidos en STAGING")
+        if (reportes.groupBy("anio", "trimestre", "indicador")
+                .count().filter(F.col("count") > 1).limit(1).count()):
+            raise ValueError("Reportes con indicador duplicado en el mismo periodo")
+        n_reportes = reportes.count()
+        if not n_reportes:
+            raise ValueError("No se extrajo ningun indicador de reportes OSIPTEL")
         salidas = {
             "original_normalizado": HDFS_BASE + "/silver/conexiones_osiptel",
             "depurados": HDFS_BASE + "/silver/conexiones_osiptel_depuradas",
@@ -185,6 +241,7 @@ def main():
             "registros_invalidos": HDFS_BASE + "/silver/conexiones_osiptel_invalidos",
             "duplicados_exactos_auditoria": HDFS_BASE + "/silver/conexiones_osiptel_duplicados_exactos",
             "inei_versiones": HDFS_BASE + "/silver/inei_indicadores_versiones",
+            "reportes_indicadores": HDFS_BASE + "/silver/osiptel_reportes_indicadores",
         }
         conexiones.write.mode("overwrite").parquet(hdfs_uri(salidas["original_normalizado"]))
         depurados.write.mode("overwrite").parquet(hdfs_uri(salidas["depurados"]))
@@ -192,6 +249,7 @@ def main():
         invalidos.write.mode("overwrite").parquet(hdfs_uri(salidas["registros_invalidos"]))
         duplicados_grupos.write.mode("overwrite").parquet(hdfs_uri(salidas["duplicados_exactos_auditoria"]))
         inei.write.mode("overwrite").parquet(hdfs_uri(salidas["inei_versiones"]))
+        reportes.write.mode("overwrite").parquet(hdfs_uri(salidas["reportes_indicadores"]))
         informe = {
             "fecha_ejecucion": datetime.now().isoformat(timespec="seconds"),
             "filas_osiptel_originales": total_osiptel,
@@ -223,12 +281,16 @@ def main():
             "filas_inei_invalidas": inei_invalidos,
             "completitud_inei": campos_inei,
             "versiones_inei_conservadas": True,
+            "indicadores_narrativos_osiptel": n_reportes,
+            "version_csv_reportes": digest_local,
+            "fuente_documental": "Reportes estadisticos OSIPTEL: textos no estructurados convertidos a indicadores",
             "salidas_hdfs": salidas,
         }
         carpeta_logs = BASE / "logs"
         carpeta_logs.mkdir(parents=True, exist_ok=True)
         log = carpeta_logs / f"silver_calidad_{datetime.now():%Y%m%d_%H%M%S}.json"
         log.write_text(json.dumps(informe, ensure_ascii=False, indent=2), encoding="utf-8")
+
         print("\nSILVER GENERADO - LIMPIEZA Y CALIDAD")
         print(f"OSIPTEL originales: {total_osiptel}")
         print(f"Invalidos: {n_invalidos}; copias exactas omitidas: {n_duplicados}")
@@ -236,6 +298,7 @@ def main():
         print(f"Valores muy altos (sobre P99.9) conservados: {n_extremos}")
         print(f"OSIPTEL depurados: {n_depurados}")
         print(f"INEI versiones: {total_inei}; invalidos: {inei_invalidos}")
+        print(f"Indicadores narrativos OSIPTEL validados: {n_reportes}")
         print(f"Reporte: {log}")
     finally:
         spark.stop()
